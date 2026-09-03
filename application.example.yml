@@ -26,18 +26,17 @@ plugins:
       vkmusic: false # Enable Vk Music lyrics source
       lrcLib: false # Enable LRC Library lyrics source (https://lrclib.net)
     spotify:
-      # clientId & clientSecret are required for using spsearch
-#      clientId: "your client id"
-#      clientSecret: "your client secret"
-      # spDc: "your sp dc cookie" # the sp dc cookie used for accessing the spotify lyrics api
+      # Leave clientId, clientSecret, and spDc unset for strict accountless Partner-only metadata.
+      # Public metadata works without Premium; audio is resolved through configured mirror providers.
+      # Private/account playlists and Spotify lyrics still require supported account authentication.
       countryCode: "US" # the country code you want to use for filtering the artists top tracks. See https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2
       playlistLoadLimit: 6 # The number of pages at 100 tracks each (also used to derive Spotify Partner API playlist track limit)
       albumLoadLimit: 6 # The number of pages at 50 tracks each (also used to derive Spotify Partner API album track limit)
-      resolveArtistsInSearch: true # Whether to resolve artists in track search results (can be slow)
+      resolveArtistsInSearch: true # Whether to resolve artists in v1 track search results (can be slow)
       localFiles: false # Enable local files support with Spotify playlists. Please note `uri` & `isrc` will be `null` & `identifier` will be `"local"`
-      preferPartnerApi: false # When true, Spotify search uses partner API by default; when false, search uses Spotify v1 API.
-      preferV1SearchApi: false # Only used when preferPartnerApi is true. Set true to force Spotify v1 search instead of partner search.
-      customTokenEndpoint: "http://localhost:8080/api/token" # Optional custom endpoint for getting the anonymous token. If not set, spotify's default endpoint will be used which might not work. The response must match spotify's anonymous token response format.
+      preferPartnerApi: true # Automatically enforced when app credentials are absent.
+      preferV1SearchApi: false # Ignored in accountless mode.
+      customTokenEndpoint: "http://localhost:8080/api/token" # Anonymous token service; isolated connect/read timeouts are 5s/30s and one HTTP 5xx is retried.
     applemusic:
       countryCode: "US" # the country code you want to use for filtering the artists top tracks and language. See https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2
       mediaAPIToken: "your apple music api token" # apple music api token

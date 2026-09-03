@@ -1,6 +1,9 @@
 package com.github.topi314.lavasrc.spotify;
 
 import com.github.topi314.lavasrc.LavaSrcTools;
+import com.sedmelluq.discord.lavaplayer.tools.JsonBrowser;
+import org.apache.http.HttpStatus;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.entity.UrlEncodedFormEntity;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
@@ -33,6 +36,14 @@ public class SpotifyTokenTracker {
 	private static final Logger log = LoggerFactory.getLogger(SpotifyTokenTracker.class);
 
 	private static final Pattern SECRET_PATTERN = Pattern.compile("\"secret\":\\[(\\d+(?:,\\d+)+)]");
+	private static final long TOKEN_REFRESH_MARGIN_SECONDS = 30;
+	private static final int CUSTOM_TOKEN_CONNECT_TIMEOUT_MS = 5_000;
+	private static final int CUSTOM_TOKEN_READ_TIMEOUT_MS = 30_000;
+	private static final RequestConfig CUSTOM_TOKEN_REQUEST_CONFIG = RequestConfig.custom()
+		.setConnectTimeout(CUSTOM_TOKEN_CONNECT_TIMEOUT_MS)
+		.setConnectionRequestTimeout(CUSTOM_TOKEN_CONNECT_TIMEOUT_MS)
+		.setSocketTimeout(CUSTOM_TOKEN_READ_TIMEOUT_MS)
+		.build();
 
 	private final SpotifySourceManager sourceManager;
 
@@ -85,8 +96,8 @@ public class SpotifyTokenTracker {
 		this.accountAccessTokenExpire = null;
 	}
 
-	private boolean hasValidCredentials() {
-		return clientId != null && !clientId.isEmpty() && clientSecret != null && !clientSecret.isEmpty();
+	boolean hasValidCredentials() {
+		return clientId != null && !clientId.isBlank() && clientSecret != null && !clientSecret.isBlank();
 	}
 
 	public String getAccessToken(boolean useAnonymousToken) throws IOException {
@@ -122,31 +133,93 @@ public class SpotifyTokenTracker {
 	}
 
 	public String getAnonymousAccessToken() throws IOException {
-		if (this.anonymousAccessToken == null || this.anonymousExpires == null || this.anonymousExpires.isBefore(Instant.now())) {
+		if (shouldRefresh(this.anonymousAccessToken, this.anonymousExpires)) {
 			synchronized (this) {
-				if (this.anonymousAccessToken == null || this.anonymousExpires == null || this.anonymousExpires.isBefore(Instant.now())) {
-					log.debug("Anonymous access token is invalid or expired, refreshing token...");
-					this.refreshAnonymousAccessToken();
+				if (shouldRefresh(this.anonymousAccessToken, this.anonymousExpires)) {
+					log.debug("Anonymous access token is invalid or nearing expiry, refreshing token...");
+					try {
+						this.refreshAnonymousAccessToken();
+					} catch (IOException | RuntimeException e) {
+						if (!isUsable(this.anonymousAccessToken, this.anonymousExpires)) {
+							throw e;
+						}
+						log.warn("Anonymous token refresh failed; using cached token until {}", this.anonymousExpires, e);
+					}
 				}
 			}
 		}
 		return this.anonymousAccessToken;
 	}
 
-	private void refreshAnonymousAccessToken() throws IOException {
-		var request = new HttpGet(generateGetAccessTokenURL());
+	private static boolean shouldRefresh(String token, Instant expiry) {
+		return token == null || expiry == null || !expiry.isAfter(Instant.now().plusSeconds(TOKEN_REFRESH_MARGIN_SECONDS));
+	}
 
-		var json = LavaSrcTools.fetchResponseAsJson(sourceManager.getHttpInterface(), request);
+	private static boolean isUsable(String token, Instant expiry) {
+		return token != null && expiry != null && expiry.isAfter(Instant.now());
+	}
+
+	private void refreshAnonymousAccessToken() throws IOException {
+		var endpoint = generateGetAccessTokenURL();
+		var json = hasCustomTokenEndpoint()
+			? fetchCustomToken(endpoint, null)
+			: LavaSrcTools.fetchResponseAsJson(sourceManager.getHttpInterface(), new HttpGet(endpoint));
+		updateAnonymousToken(json);
+	}
+
+	private boolean hasCustomTokenEndpoint() {
+		return this.customTokenEndpoint != null && !this.customTokenEndpoint.isBlank();
+	}
+
+	private JsonBrowser fetchCustomToken(String endpoint, String cookie) throws IOException {
+		try (var client = HttpClients.custom().setDefaultRequestConfig(CUSTOM_TOKEN_REQUEST_CONFIG).build()) {
+			var attempt = 0;
+			while (true) {
+				attempt++;
+				var request = new HttpGet(endpoint);
+				request.setConfig(CUSTOM_TOKEN_REQUEST_CONFIG);
+				if (cookie != null) {
+					request.addHeader("App-Platform", "WebPlayer");
+					request.addHeader("Cookie", cookie);
+				}
+
+				try (var response = client.execute(request)) {
+					var status = response.getStatusLine().getStatusCode();
+					var body = response.getEntity() == null ? "" : EntityUtils.toString(response.getEntity(), StandardCharsets.UTF_8);
+					if (status >= 500 && status <= 599 && attempt == 1) {
+						log.warn("Custom Spotify token endpoint returned HTTP {}; retrying once", status);
+						continue;
+					}
+					if (status != HttpStatus.SC_OK) {
+						throw new IOException("Custom Spotify token endpoint returned HTTP " + status);
+					}
+					try {
+						return JsonBrowser.parse(body);
+					} catch (IOException e) {
+						throw new IOException("Custom Spotify token endpoint returned invalid JSON", e);
+					}
+				}
+			}
+		}
+	}
+
+	private void updateAnonymousToken(JsonBrowser json) throws IOException {
 		if (json == null) {
-			throw new RuntimeException("No response from Spotify API while fetching anonymous access token.");
+			throw new IOException("No response from Spotify API while fetching anonymous access token.");
 		}
 		if (!json.get("error").isNull()) {
-			var error = json.get("error").text();
-			throw new RuntimeException("Error while fetching anonymous access token: " + error);
+			throw new IOException("Error while fetching anonymous access token: " + json.get("error").text());
 		}
 
-		anonymousAccessToken = json.get("accessToken").text();
-		anonymousExpires = Instant.ofEpochMilli(json.get("accessTokenExpirationTimestampMs").asLong(0));
+		var token = json.get("accessToken").text();
+		var expiryMillis = json.get("accessTokenExpirationTimestampMs").asLong(0);
+		var expiry = Instant.ofEpochMilli(expiryMillis);
+		if (token == null || token.isBlank() || !expiry.isAfter(Instant.now())) {
+			throw new IOException("Spotify token response is missing a usable accessToken or expiry.");
+		}
+
+		this.anonymousAccessToken = token;
+		this.anonymousExpires = expiry;
 	}
 
 	public void setSpDc(String spDc) {
@@ -156,11 +229,18 @@ public class SpotifyTokenTracker {
 	}
 
 	public String getAccountAccessToken() throws IOException {
-		if (this.accountAccessToken == null || this.accountAccessTokenExpire == null || this.accountAccessTokenExpire.isBefore(Instant.now())) {
+		if (shouldRefresh(this.accountAccessToken, this.accountAccessTokenExpire)) {
 			synchronized (this) {
-				if (this.accountAccessToken == null || this.accountAccessTokenExpire == null || this.accountAccessTokenExpire.isBefore(Instant.now())) {
-					log.debug("Account token is invalid or expired, refreshing token...");
-					this.refreshAccountAccessToken();
+				if (shouldRefresh(this.accountAccessToken, this.accountAccessTokenExpire)) {
+					log.debug("Account token is invalid or nearing expiry, refreshing token...");
+					try {
+						this.refreshAccountAccessToken();
+					} catch (IOException | RuntimeException e) {
+						if (!isUsable(this.accountAccessToken, this.accountAccessTokenExpire)) {
+							throw e;
+						}
+						log.warn("Account token refresh failed; using cached token until {}", this.accountAccessTokenExpire, e);
+					}
 				}
 			}
 		}
@@ -168,26 +248,28 @@ public class SpotifyTokenTracker {
 	}
 
 	public void refreshAccountAccessToken() throws IOException {
-		var request = new HttpGet(generateGetAccessTokenURL());
+		var endpoint = generateGetAccessTokenURL();
+		var request = new HttpGet(endpoint);
 		request.addHeader("App-Platform", "WebPlayer");
 		request.addHeader("Cookie", "sp_dc=" + this.spDc);
 
-		try {
-			var json = LavaSrcTools.fetchResponseAsJson(this.sourceManager.getHttpInterface(), request);
-			if (json == null) {
-				throw new RuntimeException("No response from Spotify API while fetching account access token.");
-			}
-			if (!json.get("error").isNull()) {
-				var error = json.get("error").text();
-				log.error("Error while fetching account token: {}", error);
-				throw new RuntimeException("Error while fetching account access token: " + error);
-			}
-			this.accountAccessToken = json.get("accessToken").text();
-			this.accountAccessTokenExpire = Instant.ofEpochMilli(json.get("accessTokenExpirationTimestampMs").asLong(0));
-		} catch (IOException e) {
-			log.error("Account token refreshing failed.", e);
-			throw new RuntimeException("Account token refreshing failed", e);
+		var json = hasCustomTokenEndpoint()
+			? fetchCustomToken(endpoint, "sp_dc=" + this.spDc)
+			: LavaSrcTools.fetchResponseAsJson(this.sourceManager.getHttpInterface(), request);
+		if (json == null) {
+			throw new IOException("No response from Spotify API while fetching account access token.");
 		}
+		if (!json.get("error").isNull()) {
+			throw new IOException("Error while fetching account access token: " + json.get("error").text());
+		}
+
+		var token = json.get("accessToken").text();
+		var expiry = Instant.ofEpochMilli(json.get("accessTokenExpirationTimestampMs").asLong(0));
+		if (token == null || token.isBlank() || !expiry.isAfter(Instant.now())) {
+			throw new IOException("Spotify token response is missing a usable account accessToken or expiry.");
+		}
+		this.accountAccessToken = token;
+		this.accountAccessTokenExpire = expiry;
 	}
 
 	public boolean hasValidAccountCredentials() {

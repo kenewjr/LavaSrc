@@ -77,9 +77,9 @@ Snapshot builds are available in https://maven.lavalink.dev/snapshots with the s
 
 For all supported urls and queries see [here](#supported-urls-and-queries)
 
-To get your Spotify clientId, clientSecret go [here](https://developer.spotify.com/dashboard/applications) & then copy them into your `application.yml` like the following.
+Spotify can run without an account, Premium subscription, `clientId`, `clientSecret`, or `spDc`. Leave app credentials unset, enable `preferPartnerApi`, and configure `customTokenEndpoint` to load public metadata with an anonymous web-player token. In this accountless mode the fork never falls back to Spotify Web API v1; audio is resolved through the configured mirror providers.
 
-To get your Spotify spDc cookie go [here](#spotify)
+Spotify app credentials remain optional for Web API v1 mode. `spDc` is only for account-scoped endpoints such as Spotify lyrics.
 
 To get your Apple Music api token go [here](#apple-music)
 
@@ -125,18 +125,16 @@ plugins:
       vkmusic: false # Enable Vk Music lyrics source
       lrcLib: false # Enable LRC Library lyrics source (https://lrclib.net)
     spotify:
-      # clientId & clientSecret are required for using spsearch
-#      clientId: "your client id"
-#      clientSecret: "your client secret"
-      # spDc: "your sp dc cookie" # the sp dc cookie used for accessing the spotify lyrics api
+      # Leave clientId, clientSecret, and spDc unset for strict accountless Partner-only metadata.
+      # Audio is not streamed from Spotify; the providers list resolves matching playable sources.
       countryCode: "US" # the country code you want to use for filtering the artists top tracks. See https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2
       playlistLoadLimit: 6 # The number of pages at 100 tracks each (also used to derive Spotify Partner API playlist track limit)
       albumLoadLimit: 6 # The number of pages at 50 tracks each (also used to derive Spotify Partner API album track limit)
-      resolveArtistsInSearch: true # Whether to resolve artists in track search results (can be slow)
+      resolveArtistsInSearch: true # Whether to resolve artists in v1 track search results (can be slow)
       localFiles: false # Enable local files support with Spotify playlists. Please note `uri` & `isrc` will be `null` & `identifier` will be `"local"`
-      preferPartnerApi: false # When true, Spotify search uses partner API by default; when false, search uses Spotify v1 API.
-      preferV1SearchApi: false # Only used when preferPartnerApi is true. Set true to force Spotify v1 search instead of partner search.
-      customTokenEndpoint: "http://localhost:8080/api/token" # Optional custom endpoint for getting the anonymous token. If not set, spotify's default endpoint will be used which might not work. The response must match spotify's anonymous token response format.
+      preferPartnerApi: true # Prefer Partner API; automatically enforced when app credentials are absent.
+      preferV1SearchApi: false # Ignored in accountless mode; accountless search always uses Partner API.
+      customTokenEndpoint: "http://localhost:8080/api/token" # Anonymous web-player token service. Requests use isolated 5s connect / 30s read timeouts and retry one HTTP 5xx.
     applemusic:
       countryCode: "US" # the country code you want to use for filtering the artists top tracks and language. See https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2
       mediaAPIToken: "your apple music api token" # apple music api token
@@ -318,12 +316,12 @@ PATCH /v4/lavasrc/config
 
 | Field                 | Type    | Description                                                                 |
 |-----------------------|---------|-----------------------------------------------------------------------------|
-| ?clientId             | string  | The Spotify clientId                                                        |
-| ?clientSecret         | string  | The Spotify clientSecret                                                    |
-| ?spDc                 | string  | The Spotify spDc cookie                                                     |
-| ?preferPartnerApi     | boolean | When true, Spotify search uses partner API by default                        |
-| ?preferV1SearchApi    | boolean | Only applies when `preferPartnerApi` is true; forces Spotify v1 search       |
-| ?customTokenEndpoint  | string  | The custom endpoint for getting the anonymous token                         |
+| ?clientId             | string  | Optional Spotify app client ID; omit for accountless Partner-only mode      |
+| ?clientSecret         | string  | Optional Spotify app secret; omit for accountless Partner-only mode         |
+| ?spDc                 | string  | Optional cookie for account-scoped endpoints such as Spotify lyrics        |
+| ?preferPartnerApi     | boolean | Prefer Partner API; forced on when app credentials are absent               |
+| ?preferV1SearchApi    | boolean | Force v1 search only when complete app credentials are configured           |
+| ?customTokenEndpoint  | string  | Anonymous web-player token endpoint; connect/read timeouts are 5s/30s       |
 
 ##### Apple Music Config Object
 
@@ -386,12 +384,9 @@ PATCH /v4/lavasrc/config
 ```json
 {
   "spotify": {
-    "clientId": "your client id",
-    "clientSecret": "your client secret",
-    "spDc": "your sp dc cookie", 
-    "preferPartnerApi": false,
+    "preferPartnerApi": true,
     "preferV1SearchApi": false,
-    "customTokenEndpoint": "http://localhost/api/token"
+    "customTokenEndpoint": "http://localhost:8080/api/token"
   },
   "applemusic": {
     "mediaAPIToken": "your apple music api token"
@@ -493,31 +488,23 @@ dependencies {
 
 ### Spotify
 
-To get a Spotify clientId & clientSecret you must go [here](https://developer.spotify.com/dashboard) and create a new application.
-
-<details>
-<summary>How to get sp dc cookie</summary>
-
-1. Go to https://open.spotify.com
-2. Open DevTools and go to the Application tab
-3. Copy the value of the `sp_dc` cookie
-
-</details>
+Spotify app credentials are optional. Omit them for public accountless metadata; configure complete `clientId` and `clientSecret` only when intentionally using Spotify Web API v1. `spDc` is only for account-scoped endpoints such as Spotify lyrics.
 
 ```java
 AudioPlayerManager playerManager = new DefaultAudioPlayerManager();
-
-// create a new SpotifySourceManager with the default providers, clientId, clientSecret, spDc, countryCode and AudioPlayerManager and register it
-// spDc is only needed if you want to use it with LavaLyrics
-var spotify = new SpotifySourceManager(clientId, clientSecret, spDc, countryCode, () -> playerManager, DefaultMirroringAudioTrackResolver);
+var spotify = new SpotifySourceManager(providers, null, null, countryCode, playerManager);
+spotify.setPreferPartnerApi(true);
+spotify.setCustomTokenEndpoint("http://localhost:8080/api/token");
 playerManager.registerSourceManager(spotify);
 ```
 
 #### Access Tokens
 
-Getting anonymous & account access tokens is generally optional but required if you want to resolve spotify generated playlists or lyrics.
+When `clientId` or `clientSecret` is absent, LavaSrc enters strict accountless mode. Public track, album, artist, playlist, recommendation, and search metadata use the Partner API with an anonymous web-player token. Failed Partner requests do not fall through to Spotify Web API v1, avoiding deterministic Premium-owner `403` responses. Actual audio still comes from the configured mirror providers, not Spotify.
 
-You can use a service such as [Spotify Tokener](https://github.com/topi314/spotify-tokener) via the `customTokenEndpoint` option to support those.
+Accountless mode cannot access private/account playlists or Spotify lyrics. Those features require supported account authentication; use another configured lyrics source such as LRCLIB when no account is available.
+
+You can use a service such as [Spotify Tokener](https://github.com/topi314/spotify-tokener) via the `customTokenEndpoint` option. Custom-token requests use isolated 5-second connect and 30-second read timeouts, so a slow token service does not inherit Lavaplayer's shorter shared request timeout. A transient HTTP 5xx response is retried once. Tokens are cached until expiry and refreshed 30 seconds early.
 
 #### LavaLyrics
 
@@ -852,9 +839,8 @@ playerManager.registerSourceManager(new YTDLPSourceManager("path/to/yt-dlp"));
 
 ### Spotify
 
-* `spsearch:animals architects` (check out [Spotify Search Docs](https://developer.spotify.com/documentation/web-api/reference/search) for advanced search queries like isrc & co)
-* `sprec:seed_artists=3ZztVuWxHzNpl0THurTFCv,4MzJMcHQBl9SIYSjwWn8QW&seed_genres=metalcore&seed_tracks=5ofoB8PFmocBXFBEWVb6Vz,6I5zXzSDByTEmYZ7ePVQeB`
-  (only works in [Extended quota mode](https://developer.spotify.com/documentation/web-api/concepts/quota-modes#extended-quota-mode) or with anonymous tokens, check out [Spotify Recommendations Docs](https://developer.spotify.com/documentation/web-api/reference/get-recommendations) for the full query parameter list)
+* `spsearch:animals architects` (Partner API track search works in accountless mode)
+* `sprec:<track-id>` (Partner API recommendations work in accountless mode; legacy Web API query-form recommendations still require app credentials)
 * `sprec:mix:artist:0gxyHStUsqpMadRV0Di1Qt`
 * `sprec:mix:track:4PTG3Z6ehGkBFwjybzWkR8`
 * `sprec:mix:album:7t0YTcJ3HsalOTIE6XzQYo`

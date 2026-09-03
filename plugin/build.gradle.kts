@@ -33,6 +33,7 @@ dependencies {
 
 tasks {
 	jar {
+		mustRunAfter(":main:compileTestJava")
 		exclude("dev/schlaubi/lyrics/LyricsClient*")
 		exclude("dev/schlaubi/lyrics/Lyrics_jvmKt.class")
 	}

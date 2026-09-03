@@ -107,6 +107,10 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		return value == null || value.trim().isEmpty();
 	}
 
+	private boolean isAccountless() {
+		return !this.tokenTracker.hasValidCredentials();
+	}
+
 	public void setPlaylistPageLimit(int playlistPageLimit) {
 		this.playlistPageLimit = playlistPageLimit;
 	}
@@ -301,12 +305,31 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public JsonBrowser getJson(String uri) throws IOException {
+		if (this.isAccountless() && uri.startsWith(API_BASE)) {
+			throw new IOException("Spotify Web API v1 is unavailable without app credentials; use Partner API metadata.");
+		}
 		var request = new HttpGet(uri);
 		request.addHeader("Authorization", "Bearer " + this.tokenTracker.getAccessToken(false));
 		return LavaSrcTools.fetchResponseAsJson(this.httpInterfaceManager.getInterface(), request);
 	}
 
 	private AudioSearchResult getAutocomplete(String query, Set<AudioSearchResult.Type> types) throws IOException {
+		if (this.isAccountless()) {
+			if (!types.isEmpty() && !types.contains(AudioSearchResult.Type.TRACK)) {
+				return AudioSearchResult.EMPTY;
+			}
+			var result = this.partnerApiClient.loadPartnerSearch(query, false, this);
+			if (!(result instanceof AudioPlaylist)) {
+				return AudioSearchResult.EMPTY;
+			}
+			return new BasicAudioSearchResult(
+				((AudioPlaylist) result).getTracks(),
+				new ArrayList<>(),
+				new ArrayList<>(),
+				new ArrayList<>(),
+				new ArrayList<>()
+			);
+		}
 		if (types.isEmpty()) {
 			types = SEARCH_TYPES;
 		}
@@ -361,6 +384,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getSearch(String query, boolean preview) throws IOException {
+		if (this.isAccountless()) {
+			return this.partnerApiClient.loadPartnerSearch(query, preview, this);
+		}
 		if (this.preferPartnerApi && !this.preferV1SearchApi) {
 			try {
 				var partnerSearch = this.partnerApiClient.loadPartnerSearch(query, preview, this);
@@ -435,6 +461,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		}
 
 		var seedTrackId = query;
+		if (this.isAccountless()) {
+			return this.partnerApiClient.loadPartnerRecommendations(seedTrackId, preview, this);
+		}
 		if (this.preferPartnerApi) {
 			try {
 				var partnerRecommendations = this.partnerApiClient.loadPartnerRecommendations(seedTrackId, preview, this);
@@ -469,6 +498,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getAlbum(String id, boolean preview) throws IOException {
+		if (this.isAccountless()) {
+			return this.partnerApiClient.loadPartnerAlbum(id, preview, Math.max(1, this.albumPageLimit) * ALBUM_MAX_PAGE_ITEMS, this);
+		}
 		if (this.preferPartnerApi) {
 			try {
 				var partnerAlbum = this.partnerApiClient.loadPartnerAlbum(id, preview, Math.max(1, this.albumPageLimit) * ALBUM_MAX_PAGE_ITEMS, this);
@@ -529,6 +561,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getPlaylist(String id, boolean preview) throws IOException {
+		if (this.isAccountless()) {
+			return this.partnerApiClient.loadPartnerPlaylist(id, preview, Math.max(1, this.playlistPageLimit) * PLAYLIST_MAX_PAGE_ITEMS, this);
+		}
 		if (this.preferPartnerApi) {
 			try {
 				var playlist = this.partnerApiClient.loadPartnerPlaylist(id, preview, Math.max(1, this.playlistPageLimit) * PLAYLIST_MAX_PAGE_ITEMS, this);
@@ -575,6 +610,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getArtist(String id, boolean preview) throws IOException {
+		if (this.isAccountless()) {
+			return this.partnerApiClient.loadPartnerArtist(id, preview, this);
+		}
 		if (this.preferPartnerApi) {
 			try {
 				var partnerArtist = this.partnerApiClient.loadPartnerArtist(id, preview, this);
@@ -608,6 +646,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	public AudioItem getTrack(String id, boolean preview) throws IOException {
+		if (this.isAccountless()) {
+			return this.partnerApiClient.loadPartnerTrack(id, preview, this);
+		}
 		if (this.preferPartnerApi) {
 			try {
 				var partnerTrack = this.partnerApiClient.loadPartnerTrack(id, preview, this);
