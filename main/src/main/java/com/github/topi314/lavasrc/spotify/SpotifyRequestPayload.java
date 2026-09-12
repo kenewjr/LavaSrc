@@ -41,6 +41,10 @@ public class SpotifyRequestPayload {
 		return this;
 	}
 
+	String getOperationName() {
+		return this.operationName;
+	}
+
 	public String serialize() throws IOException {
 		ObjectNode persistedQuery = MAPPER.createObjectNode();
 		persistedQuery.put("version", 1);

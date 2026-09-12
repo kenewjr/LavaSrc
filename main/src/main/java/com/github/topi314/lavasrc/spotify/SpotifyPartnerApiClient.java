@@ -1,16 +1,21 @@
 package com.github.topi314.lavasrc.spotify;
 
 import com.github.topi314.lavasrc.ExtendedAudioPlaylist;
-import com.github.topi314.lavasrc.LavaSrcTools;
+import com.sedmelluq.discord.lavaplayer.tools.FriendlyException;
 import com.sedmelluq.discord.lavaplayer.tools.JsonBrowser;
-import com.sedmelluq.discord.lavaplayer.tools.io.HttpInterface;
+import com.sedmelluq.discord.lavaplayer.tools.io.HttpClientTools;
+import com.sedmelluq.discord.lavaplayer.tools.io.HttpInterfaceManager;
 import com.sedmelluq.discord.lavaplayer.track.AudioItem;
 import com.sedmelluq.discord.lavaplayer.track.AudioReference;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrack;
 import com.sedmelluq.discord.lavaplayer.track.AudioTrackInfo;
 import com.sedmelluq.discord.lavaplayer.track.BasicAudioPlaylist;
+import org.apache.http.HttpEntity;
+import org.apache.http.NoHttpResponseException;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
+import org.apache.http.conn.ConnectTimeoutException;
 import org.apache.http.entity.StringEntity;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -23,6 +28,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 public class SpotifyPartnerApiClient {
@@ -35,21 +46,22 @@ public class SpotifyPartnerApiClient {
 	private static final Logger log = LoggerFactory.getLogger(SpotifyPartnerApiClient.class);
 
 	private final SpotifyTokenTracker tokenTracker;
-	private final HttpInterface httpInterface;
+	private final HttpInterfaceManager httpInterfaceManager;
+	private final AtomicLong retryAfterMillis = new AtomicLong();
 
-	public SpotifyPartnerApiClient(SpotifyTokenTracker tokenTracker, HttpInterface httpInterface) {
+	public SpotifyPartnerApiClient(SpotifyTokenTracker tokenTracker, HttpInterfaceManager httpInterfaceManager) {
 		this.tokenTracker = tokenTracker;
-		this.httpInterface = httpInterface;
+		this.httpInterfaceManager = httpInterfaceManager;
 	}
 
-	private HttpPost createBaseRequest(SpotifyRequestPayload payload) throws IOException {
+	private HttpPost createBaseRequest(SpotifyRequestPayload payload, String token) throws IOException {
 		var request = new HttpPost(PARTNER_API_BASE);
 
 		request.setHeader("User-Agent", USER_AGENT);
 		request.setHeader("Content-Type", "application/json");
 		// Partner API accepts the anonymous web-player token. Account tokens are
 		// reserved for account-scoped endpoints such as lyrics.
-		request.setHeader("Authorization", "Bearer " + this.tokenTracker.getAnonymousAccessToken());
+		request.setHeader("Authorization", "Bearer " + token);
 		request.setHeader("Spotify-App-Version", "1.2.80.289.gd6b01cc3");
 		request.setHeader("Referer", "https://open.spotify.com/");
 
@@ -58,10 +70,148 @@ public class SpotifyPartnerApiClient {
 		return request;
 	}
 
+	private JsonBrowser request(SpotifyRequestPayload payload) throws IOException {
+		var operation = payload.getOperationName();
+		var started = System.nanoTime();
+		// All payloads here are read-only GraphQL queries, despite using HTTP POST.
+		for (int attempt = 1; attempt <= 2; attempt++) {
+			checkInterrupted(operation);
+			if (System.currentTimeMillis() < this.retryAfterMillis.get()) {
+				throw failure(operation, "RATE_LIMITED", 429);
+			}
+			String token;
+			try {
+				token = this.tokenTracker.getAnonymousAccessToken();
+			} catch (IOException e) {
+				throw failure(operation, "TOKEN_UNAVAILABLE", 0);
+			}
+			var request = createBaseRequest(payload, token);
+			int status;
+			try (var http = this.httpInterfaceManager.getInterface()) {
+				var config = http.getContext().getRequestConfig();
+				request.setConfig(RequestConfig.copy(config == null ? HttpClientTools.DEFAULT_REQUEST_CONFIG : config)
+					.setConnectTimeout(5_000).setConnectionRequestTimeout(5_000).setSocketTimeout(10_000)
+					.setRedirectsEnabled(false).build());
+				try (var response = http.execute(request)) {
+					status = response.getStatusLine().getStatusCode();
+					if (status == 401) {
+						this.tokenTracker.invalidateAnonymousToken(token);
+						if (attempt == 2) {
+							throw failure(operation, "TOKEN_REJECTED", status);
+						}
+					} else if (status == 429) {
+						var header = response.getFirstHeader("Retry-After");
+						var until = parseRetryAfter(header == null ? null : header.getValue(), System.currentTimeMillis());
+						this.retryAfterMillis.accumulateAndGet(until, Math::max);
+						throw failure(operation, "RATE_LIMITED", status);
+					} else if (status == 502 || status == 503 || status == 504) {
+						if (attempt == 2) {
+							throw failure(operation, "UPSTREAM_UNAVAILABLE", status);
+						}
+					} else if (status != 200) {
+						throw failure(operation, status == 403 ? "ACCESS_DENIED" : "HTTP_ERROR", status);
+					} else {
+						var json = readJson(response.getEntity(), operation);
+						var errors = json.get("errors");
+						if (!errors.isNull() && (!errors.isList() || !errors.values().isEmpty())) {
+							boolean staleQuery = errors.values().stream().anyMatch(error ->
+								"PersistedQueryNotFound".equals(error.get("message").text())
+									|| "PERSISTED_QUERY_NOT_FOUND".equals(error.get("extensions").get("code").text()));
+							throw failure(operation, staleQuery ? "QUERY_OUTDATED" : "GRAPHQL_ERROR", 200);
+						}
+						if (!json.get("data").isMap()) {
+							throw failure(operation, "INVALID_PAYLOAD", 200);
+						}
+						log.debug("Spotify operation={} status=200 attempt={} durationMs={}", operation, attempt,
+							(System.nanoTime() - started) / 1_000_000);
+						return json;
+					}
+				}
+			} catch (IOException e) {
+				checkInterrupted(operation);
+				boolean transientFailure = e instanceof SocketException || e instanceof SocketTimeoutException
+					|| e instanceof NoHttpResponseException || e instanceof ConnectTimeoutException;
+				if (!transientFailure || attempt == 2) {
+					throw failure(operation, e instanceof SocketTimeoutException || e instanceof ConnectTimeoutException
+						? "TIMEOUT" : "NETWORK_ERROR", 0);
+				}
+				log.warn("Spotify operation={} category=TRANSPORT retry=1", operation);
+				pauseBeforeRetry(operation);
+				continue;
+			}
+			log.warn("Spotify operation={} status={} retry=1", operation, status);
+			if (status != 401) {
+				pauseBeforeRetry(operation);
+			}
+		}
+		throw failure(operation, "UPSTREAM_UNAVAILABLE", 0);
+	}
+
+	private static JsonBrowser readJson(HttpEntity entity, String operation) throws IOException {
+		if (entity == null) {
+			throw failure(operation, "INVALID_PAYLOAD", 200);
+		}
+		try (var input = entity.getContent()) {
+			var body = input.readNBytes((4 << 20) + 1);
+			if (body.length > 4 << 20) {
+				throw failure(operation, "PAYLOAD_TOO_LARGE", 200);
+			}
+			try {
+				var json = JsonBrowser.parse(new String(body, StandardCharsets.UTF_8));
+				if (!json.isMap()) {
+					throw failure(operation, "INVALID_PAYLOAD", 200);
+				}
+				return json;
+			} catch (IOException e) {
+				// Parser exceptions may include raw response fragments.
+				throw failure(operation, "INVALID_JSON", 200);
+			}
+		}
+	}
+
+	static long parseRetryAfter(String value, long now) {
+		if (value != null) {
+			try {
+				long seconds = Long.parseLong(value.trim());
+				if (seconds >= 0) {
+					return Math.addExact(now, Math.multiplyExact(seconds, 1_000));
+				}
+			} catch (NumberFormatException | ArithmeticException ignored) {
+				try {
+					return Math.max(now, ZonedDateTime.parse(value.trim(), DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli());
+				} catch (DateTimeParseException ignoredDate) {
+					// Missing or malformed Retry-After uses a short conservative cooldown.
+				}
+			}
+		}
+		return now + 5_000;
+	}
+
+	private static void pauseBeforeRetry(String operation) {
+		try {
+			Thread.sleep(200);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw failure(operation, "INTERRUPTED", 0);
+		}
+	}
+
+	private static void checkInterrupted(String operation) {
+		if (Thread.currentThread().isInterrupted()) {
+			throw failure(operation, "INTERRUPTED", 0);
+		}
+	}
+
+	private static FriendlyException failure(String operation, String category, int status) {
+		log.warn("Spotify operation={} category={} status={}", operation, category, status);
+		return new FriendlyException("Spotify " + operation + " failed [" + category + "]"
+			+ (status == 0 ? "" : " (HTTP " + status + ")"), FriendlyException.Severity.SUSPICIOUS, null);
+	}
+
 	public JsonBrowser search(String query, int offset, int limit, boolean includeAudiobooks,
 	                          boolean includeArtistHasConcertsField, boolean includePreReleases,
 	                          boolean includeAuthors, int numberOfTopResults) throws IOException {
-		var request = createBaseRequest(SpotifyRequestPayload.forSearch(
+		return request(SpotifyRequestPayload.forSearch(
 			query,
 			offset,
 			limit,
@@ -70,7 +220,6 @@ public class SpotifyPartnerApiClient {
 			includePreReleases,
 			includeAuthors,
 			numberOfTopResults));
-		return LavaSrcTools.fetchResponseAsJson(httpInterface, request);
 	}
 
 	public List<JsonBrowser> searchTrackItems(String query, int limit) throws IOException {
@@ -107,8 +256,7 @@ public class SpotifyPartnerApiClient {
 	}
 
 	public JsonBrowser getRecommendations(String uri) throws IOException {
-		var request = createBaseRequest(SpotifyRequestPayload.forRecommendations(uri));
-		return LavaSrcTools.fetchResponseAsJson(httpInterface, request);
+		return request(SpotifyRequestPayload.forRecommendations(uri));
 	}
 
 	public List<JsonBrowser> getRecommendationTrackItems(String seedTrackId) throws IOException {
@@ -168,8 +316,7 @@ public class SpotifyPartnerApiClient {
 	}
 
 	public JsonBrowser getTrack(String uri) throws IOException {
-		var request = createBaseRequest(SpotifyRequestPayload.forTrack(uri));
-		return LavaSrcTools.fetchResponseAsJson(httpInterface, request);
+		return request(SpotifyRequestPayload.forTrack(uri));
 	}
 
 	@Nullable
@@ -193,8 +340,7 @@ public class SpotifyPartnerApiClient {
 	}
 
 	public JsonBrowser getPlaylist(String uri, int offset, int limit) throws IOException {
-		var request = createBaseRequest(SpotifyRequestPayload.forPlaylist(uri, offset, limit));
-		return LavaSrcTools.fetchResponseAsJson(httpInterface, request);
+		return request(SpotifyRequestPayload.forPlaylist(uri, offset, limit));
 	}
 
 	@Nullable
@@ -224,7 +370,7 @@ public class SpotifyPartnerApiClient {
 	}
 
 	public AudioItem loadPartnerPlaylist(String id, boolean preview, int limit, SpotifySourceManager sourceManager) throws IOException {
-		var playlistData = this.getPlaylistV2(id, 0, limit);
+		var playlistData = this.getPlaylistV2(id, 0, Math.min(limit, 100));
 		if (playlistData == null) {
 			return AudioReference.NO_TRACK;
 		}
@@ -241,18 +387,42 @@ public class SpotifyPartnerApiClient {
 		}
 
 		var playlistOwner = playlistData.get("ownerV2").get("data").get("name").text();
-		var tracksJson = this.getPlaylistTrackItems(playlistData);
 		var tracks = new ArrayList<AudioTrack>();
-		for (var item : tracksJson) {
-			tracks.add(this.parseTrackV2(item, preview, null, sourceManager));
+		var rawOffset = 0;
+
+		var currentPage = playlistData;
+		while (currentPage != null && tracks.size() < limit) {
+			var content = currentPage.get("content");
+			var rawItems = content.get("items");
+			if (!rawItems.isList() || rawItems.values().isEmpty()) {
+				break;
+			}
+			int pageSize = rawItems.values().size();
+			for (var item : rawItems.values()) {
+				if ("track".equalsIgnoreCase(item.get("itemV2").get("data").get("__typename").text())) {
+					tracks.add(this.parseTrackV2(item, preview, null, sourceManager));
+					if (tracks.size() >= limit) {
+						break;
+					}
+				}
+			}
+			rawOffset += pageSize;
+			long totalCount = content.get("totalCount").asLong(-1);
+			if (totalCount >= 0 && rawOffset >= totalCount) {
+				break;
+			}
+			if (tracks.size() >= limit) {
+				break;
+			}
+			int nextLimit = Math.min(limit - tracks.size(), 100);
+			currentPage = this.getPlaylistV2(id, rawOffset, nextLimit);
 		}
 
 		return new SpotifyAudioPlaylist(playlistName, tracks, ExtendedAudioPlaylist.Type.PLAYLIST, playlistUrl, playlistImage, playlistOwner, tracks.size());
 	}
 
 	public JsonBrowser getAlbum(String id, int offset, int limit) throws IOException {
-		HttpPost request = createBaseRequest(SpotifyRequestPayload.forAlbum(id, offset, limit));
-		return LavaSrcTools.fetchResponseAsJson(httpInterface, request);
+		return request(SpotifyRequestPayload.forAlbum(id, offset, limit));
 	}
 
 	@Nullable
@@ -297,7 +467,7 @@ public class SpotifyPartnerApiClient {
 	}
 
 	public AudioItem loadPartnerAlbum(String id, boolean preview, int limit, SpotifySourceManager sourceManager) throws IOException {
-		var albumData = this.getAlbumUnion(id, 0, limit);
+		var albumData = this.getAlbumUnion(id, 0, Math.min(limit, 50));
 		if (albumData == null) {
 			return AudioReference.NO_TRACK;
 		}
@@ -322,20 +492,43 @@ public class SpotifyPartnerApiClient {
 		}
 
 		var tracks = new ArrayList<AudioTrack>();
-		for (var partnerTrack : this.getAlbumTrackItems(albumData)) {
-			if (partnerTrack.get("track").isNull()) {
-				tracks.add(this.parsePartnerTrack(partnerTrack, preview, albumImage, sourceManager));
-			} else {
-				tracks.add(this.parseTrackV2(partnerTrack.get("track"), preview, albumImage, sourceManager));
+		var rawOffset = 0;
+		var currentPage = albumData;
+
+		while (currentPage != null && tracks.size() < limit) {
+			var albumTrackItems = this.getAlbumTrackItems(currentPage);
+			if (albumTrackItems.isEmpty()) {
+				break;
 			}
+			int pageSize = albumTrackItems.size();
+			for (var partnerTrack : albumTrackItems) {
+				if (partnerTrack.get("track").isNull()) {
+					tracks.add(this.parsePartnerTrack(partnerTrack, preview, albumImage, sourceManager));
+				} else {
+					tracks.add(this.parseTrackV2(partnerTrack.get("track"), preview, albumImage, sourceManager));
+				}
+				if (tracks.size() >= limit) {
+					break;
+				}
+			}
+			rawOffset += pageSize;
+			long totalCount = currentPage.get("tracksV2").get("totalCount").asLong(
+				currentPage.get("tracks").get("totalCount").asLong(-1));
+			if (totalCount >= 0 && rawOffset >= totalCount) {
+				break;
+			}
+			if (tracks.size() >= limit) {
+				break;
+			}
+			int nextLimit = Math.min(limit - tracks.size(), 50);
+			currentPage = this.getAlbumUnion(id, rawOffset, nextLimit);
 		}
 
 		return new SpotifyAudioPlaylist(albumName, tracks, ExtendedAudioPlaylist.Type.ALBUM, albumUrl, albumImage, albumArtist, tracks.size());
 	}
 
 	public JsonBrowser getArtist(String id) throws IOException {
-		var request = createBaseRequest(SpotifyRequestPayload.forArtist(id));
-		return LavaSrcTools.fetchResponseAsJson(httpInterface, request);
+		return request(SpotifyRequestPayload.forArtist(id));
 	}
 
 	@Nullable
@@ -485,9 +678,6 @@ public class SpotifyPartnerApiClient {
 		if (track.get("externalIds") != null && track.get("externalIds").get("isrc") != null) {
 			isrc = track.get("externalIds").get("isrc").text();
 		}
-		if (isNullOrBlank(isrc) && !isNullOrBlank(identifier)) {
-			isrc = this.fetchIsrcViaSpClientMetadata(identifier);
-		}
 
 		String previewUrl = null;
 		if (track.get("previews") != null && track.get("previews").get("audioPreviews") != null && track.get("previews").get("audioPreviews").get("items") != null && !track.get("previews").get("audioPreviews").get("items").values().isEmpty()) {
@@ -569,9 +759,6 @@ public class SpotifyPartnerApiClient {
 		if (track.get("externalIds") != null && track.get("externalIds").get("isrc") != null) {
 			isrc = track.get("externalIds").get("isrc").text();
 		}
-		if (isNullOrBlank(isrc) && !isNullOrBlank(identifier)) {
-			isrc = this.fetchIsrcViaSpClientMetadata(identifier);
-		}
 
 		return new SpotifyAudioTrack(
 			new AudioTrackInfo(title, author, preview ? PREVIEW_LENGTH : length, identifier, false, uri, artworkUrl, isrc),
@@ -626,9 +813,6 @@ public class SpotifyPartnerApiClient {
 		if (isNullOrBlank(isrc)) {
 			isrc = trackData.get("external_ids").get("isrc").text();
 		}
-		if (isNullOrBlank(isrc) && !isNullOrBlank(identifier)) {
-			isrc = this.fetchIsrcViaSpClientMetadata(identifier);
-		}
 
 		return new SpotifyAudioTrack(
 			new AudioTrackInfo(title, author, length, identifier, false, uri, artworkUrl, isrc),
@@ -674,18 +858,36 @@ public class SpotifyPartnerApiClient {
 		request.setHeader("User-Agent", USER_AGENT);
 		request.setHeader("Accept", "application/json");
 		request.setHeader("Content-Type", "application/json");
-		try {
-			request.setHeader("Authorization", "Bearer " + this.tokenTracker.getAnonymousAccessToken());
-		} catch (IOException e) {
-			log.debug("Failed to get anonymous Spotify token for metadata isrc fallback: {}", e.getMessage());
+		if (System.currentTimeMillis() < this.retryAfterMillis.get() || Thread.currentThread().isInterrupted()) {
 			return null;
 		}
-
-		try {
-			var json = LavaSrcTools.fetchResponseAsJson(this.httpInterface, request);
-			return parseIsrcFromSpClientMetadata(json);
-		} catch (Exception e) {
-			log.debug("Failed to fetch ISRC via spclient metadata: {}", e.getMessage());
+		// Optional enrichment must not wait for Chrome/token refresh on the playback path.
+		var token = this.tokenTracker.getCachedAnonymousAccessToken();
+		if (token == null) {
+			return null;
+		}
+		request.setHeader("Authorization", "Bearer " + token);
+		try (var http = this.httpInterfaceManager.getInterface()) {
+			var config = http.getContext().getRequestConfig();
+			request.setConfig(RequestConfig.copy(config == null ? HttpClientTools.DEFAULT_REQUEST_CONFIG : config)
+				.setConnectTimeout(2_000).setConnectionRequestTimeout(2_000).setSocketTimeout(2_000)
+				.setRedirectsEnabled(false).build());
+			try (var response = http.execute(request)) {
+				var status = response.getStatusLine().getStatusCode();
+				if (status == 429) {
+					var header = response.getFirstHeader("Retry-After");
+					var until = parseRetryAfter(header == null ? null : header.getValue(), System.currentTimeMillis());
+					this.retryAfterMillis.accumulateAndGet(until, Math::max);
+					return null;
+				}
+				if (status != 200) {
+					log.debug("Spotify operation=isrc status={}; using text mirror", status);
+					return null;
+				}
+				return parseIsrcFromSpClientMetadata(readJson(response.getEntity(), "isrc"));
+			}
+		} catch (IOException | FriendlyException e) {
+			log.debug("Spotify operation=isrc failed; using text mirror");
 			return null;
 		}
 	}

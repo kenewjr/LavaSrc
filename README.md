@@ -79,7 +79,16 @@ For all supported urls and queries see [here](#supported-urls-and-queries)
 
 Spotify can run without an account, Premium subscription, `clientId`, `clientSecret`, or `spDc`. Leave app credentials unset, enable `preferPartnerApi`, and configure `customTokenEndpoint` to load public metadata with an anonymous web-player token. In this accountless mode the fork never falls back to Spotify Web API v1; audio is resolved through the configured mirror providers.
 
-Spotify app credentials remain optional for Web API v1 mode. `spDc` is only for account-scoped endpoints such as Spotify lyrics.
+### Spotify Enhancements (September 2026 Fork Patch)
+
+- **Isolated HTTP Requests**: Requests no longer share a single acquired HTTP context across threads. Each request borrows and closes its interface from the connection pool.
+- **Lazy ISRC Resolution**: Loading playlists or albums no longer executes hundreds of serial requests for tracks missing an ISRC. Existing metadata ISRCs are preserved immediately, while missing ISRCs are resolved lazily (at most once per track instance) during mirror playback when an `%ISRC%` provider is evaluated.
+- **Bounded Read-Only Retries**: Read-only GraphQL Partner API requests retry transient transport failures (such as `java.net.SocketException: Connection reset` and timeouts) and 502/503/504 errors at most once with a short pause.
+- **Rate Limit & Cooldown**: HTTP 429 parses `Retry-After` and enforces a non-blocking cooldown. Subsequent calls fail fast without sleeping or blocking worker threads.
+- **Safe Logging & Diagnostics**: Logs output operation names, status codes, attempt counts, and categorized failure reasons (`[NETWORK_ERROR]`, `[RATE_LIMITED]`, `[QUERY_OUTDATED]`, `[ACCESS_DENIED]`). Sensitive tokens, cookies, and raw payloads are never logged.
+- **Bounded Pagination**: Playlist and album loading fetches up to the configured limits in pages of 100/50 items using raw item offsets without unbounded recursion.
+- **Local Shaded JAR**: Build output is located at `plugin/build/libs/lavasrc-plugin-a4885e9.jar`. To deploy manually, copy this JAR into the Lavalink `plugins` folder and remove older versions (such as `lavasrc-plugin-20d6b0b.jar`).
+
 
 To get your Apple Music api token go [here](#apple-music)
 

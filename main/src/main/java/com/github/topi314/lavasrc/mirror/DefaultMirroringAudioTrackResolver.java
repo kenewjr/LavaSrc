@@ -37,8 +37,9 @@ public class DefaultMirroringAudioTrackResolver implements MirroringAudioTrackRe
 			}
 
 			if (provider.contains(MirroringAudioSourceManager.ISRC_PATTERN)) {
-				if (mirroringAudioTrack.getInfo().isrc != null && !mirroringAudioTrack.getInfo().isrc.isEmpty()) {
-					provider = provider.replace(MirroringAudioSourceManager.ISRC_PATTERN, mirroringAudioTrack.getInfo().isrc.replace("-", ""));
+				var isrc = mirroringAudioTrack.getResolutionIsrc();
+				if (isrc != null && !isrc.isBlank()) {
+					provider = provider.replace(MirroringAudioSourceManager.ISRC_PATTERN, isrc.replace("-", ""));
 				} else {
 					log.debug("Ignoring identifier \"{}\" because this track does not have an ISRC!", provider);
 					continue;

@@ -133,9 +133,39 @@ class SpotifyTokenTrackerTest {
 		assertEquals(2, requests.get());
 	}
 
+	@Test
+	void invalidatingOldTokenDoesNotClearNewerToken() throws Exception {
+		var tracker = new SpotifyTokenTracker(null, null, null, null, null);
+		setTokenCache(tracker, "new-token", Instant.now().plusSeconds(300));
+
+		tracker.invalidateAnonymousToken("stale-token");
+		assertEquals("new-token", tracker.getCachedAnonymousAccessToken());
+
+		tracker.invalidateAnonymousToken("new-token");
+		assertEquals(null, tracker.getCachedAnonymousAccessToken());
+	}
+
+	@Test
+	void cooldownPreventsLoopingRefreshWhenCachedTokenIsUsable() throws Exception {
+		var requests = new AtomicInteger();
+		this.startServer(exchange -> {
+			requests.incrementAndGet();
+			writeJson(exchange, 500, "{}");
+		});
+		var tracker = new SpotifyTokenTracker(null, null, null, null, this.endpoint());
+		setTokenCache(tracker, "cached-token", Instant.now().plusSeconds(20));
+
+		// Custom token endpoint retries once on HTTP 500, so first refresh cycle makes 2 requests
+		assertEquals("cached-token", tracker.getAnonymousAccessToken());
+		assertEquals(2, requests.get());
+
+		// Second call within 5s cooldown window should not hit server again
+		assertEquals("cached-token", tracker.getAnonymousAccessToken());
+		assertEquals(2, requests.get());
+	}
+
 	private static void setTokenCache(SpotifyTokenTracker tracker, String token, Instant expiry) throws ReflectiveOperationException {
-		setField(tracker, "anonymousAccessToken", token);
-		setField(tracker, "anonymousExpires", expiry);
+		setField(tracker, "anonymousToken", java.util.Map.entry(token, expiry));
 	}
 
 	private static void setField(SpotifyTokenTracker tracker, String name, Object value) throws ReflectiveOperationException {

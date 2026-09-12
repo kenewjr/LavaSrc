@@ -27,6 +27,11 @@ public abstract class MirroringAudioTrack extends ExtendedAudioTrack {
 
 	protected abstract InternalAudioTrack createAudioTrack(AudioTrackInfo trackInfo, SeekableInputStream inputStream);
 
+	/** May enrich a missing ISRC during resolution, never during metadata serialization. */
+	public String getResolutionIsrc() {
+		return this.trackInfo.isrc;
+	}
+
 	@Override
 	public void process(LocalAudioTrackExecutor executor) throws Exception {
 		if (this.isPreview) {
